@@ -1,0 +1,266 @@
+<?php
+
+/**
+ * @file
+ * Functions for the interface to broadcast voicemail to all users
+ */
+
+/**
+  * Class for help
+  */
+class Broadcast {
+
+  /*
+   * rank (for prioritizing modules)
+   */
+  function rank() {
+
+    $rank = 4;
+    return $rank;
+  }
+
+  /*
+   * init
+   */
+  function init() {
+  }
+
+  /*
+   * Adds menu item to nav menu
+   *
+   * @param $args
+   *   Common arguments
+   */
+  function navMenu($args) {
+
+    // put if statement in return string, because do not know $logout until page is built
+    $ret .= "
+      <?php if ($logout !='') { ?>
+        <p><small><small><a href='" . $_SESSION['ARI_ROOT'] . "?m=Broadcast&f=display'>" . _("Broadcast") . "</a></small></small></p>
+      <?php } ?>";
+
+    return $ret;
+  }
+
+  /*
+   * Acts on the selected call monitor recordings in the method indicated by the action and updates page
+   *
+   * @param $args
+   *   Common arguments
+   */
+  function action($args) {
+
+    global $ASTERISK_VOICEMAIL_CONF;
+    global $ASTERISK_VOICEMAIL_CONTEXT;
+    global $ASTERISK_VOICEMAIL_PATH;
+    global $ARI_VOICEMAIL_AUDIO_FORMAT_DEFAULT;
+
+    // args
+    $m = getArgument($args,'m');
+    $f = getArgument($args,'f');
+    $a = getArgument($args,'a');
+
+    if ($a=='broadcast') {
+
+      // validate file name
+      $buf = substr($_FILES['filename']['name'],count($_FILES['filename']['name'])-5,4);
+      if ($buf!=$ARI_VOICEMAIL_AUDIO_FORMAT_DEFAULT) {
+        $_SESSION['ari_error'] = $_FILES['filename']['name'] . " is not a " . $ARI_VOICEMAIL_AUDIO_FORMAT_DEFAULT . " file";
+      }
+      $vm_recording_file = $_FILES['filename']['tmp_name'];
+
+      // build voicemail text file
+      $vm_text_file = '/tmp/msg.txt';
+      if (is_file($vm_text_file)) {
+        unlink($vm_text_file);
+      }
+
+      $fh = fopen($vm_text_file,"a");
+      $data = ";\n";
+      $data .= "; Message Information file\n";
+      $data .= ";\n";
+      $data .= "[message]\n";
+      $data .= "origmailbox=0\n";
+      $data .= "context=broadcast\n";
+      $data .= "macrocontext=broadcast\n";
+      $data .= "exten=broadcast\n";
+      $data .= "priority=1\n";
+      $data .= "callerchan=0\n";
+      $data .= "callerid=broadcast\n";
+      $data .= "origdate=" . date('D M d h:i:s A T Y') . "\n";
+      $data .= "origtime=" . time() . "\n";
+      $data .= "category=\n";
+      $data .= "duration=unknown\n";
+      fwrite($fh,$data);
+      fclose($fh);
+
+      // get voicemail paths
+      $vm_paths = array();
+      if (is_readable($ASTERISK_VOICEMAIL_CONF)) {
+
+        $lines = file($ASTERISK_VOICEMAIL_CONF);
+
+        // look for include files and tack their lines to end of array
+        foreach ($lines as $key => $line) {
+
+          if (preg_match("/include/i",$line)) {
+
+            $include_filename = '';
+            $parts = split(' ',$line);
+            if (isset($parts[1])) {
+              $include_filename = trim($parts[1]);
+            }
+
+            if ($include_filename) {
+              $path_parts = pathinfo($ASTERISK_VOICEMAIL_CONF);
+              $include_path = fixPathSlash($path_parts['dirname']) . $include_filename;
+              foreach (glob($include_path) as $include_file) {
+                $include_lines = file($include_file);
+                $lines = array_merge($include_lines,$lines);
+              }
+            }
+          }
+        }
+
+        // process
+        foreach ($lines as $key => $line) {
+
+          // check for current context and process
+          if (preg_match("/\[.*\]/i",$line)) {
+            $currentContext = trim(preg_replace('/\[|\]/', '', $line));
+          }
+          if ($ASTERISK_VOICEMAIL_CONTEXT &&
+                $currentContext!=$ASTERISK_VOICEMAIL_CONTEXT) {
+            continue;
+          }
+
+          // check for user and process
+          unset($value);
+          $parts = split('=>',$line);
+          if (isset($parts[0])) {
+            $var = $parts[0];
+          }
+          if (isset($parts[1])) {
+            $value = $parts[1];
+          }
+          $var = trim($var);
+          if ($value) {
+            $buf = split(',',$value);
+
+            $extension = $var;
+            $context = $currentContext;
+            $path = $ASTERISK_VOICEMAIL_PATH . "/" . $context . "/" . $extension . "/INBOX";
+
+            array_push($vm_paths,$path);
+          }
+        }
+      }
+      else {
+        $_SESSION['ari_error'] = "File not readable: " . $ASTERISK_VOICEMAIL_CONF;
+        return;
+      }
+
+      // get last message for voicemail box and copy broadcast text file and recording
+      foreach ($vm_paths as $path) {
+        $count = 0;
+        $files = getFiles($path,'.txt',0,0);
+        foreach ($files as $file) {
+
+          $num = intval(substr($file,count($file)-9,4));
+          if ($num>$count) {
+            $count = $num;
+        //    echo substr($file,count($file)-9,4) . "<br>";
+          }
+        }
+        $count++;
+
+        // copy text file to voicemail box
+        $new_vm_text_file = $path . "/msg" . sprintf("%04d", $count) . ".txt";
+        if (!copy($vm_text_file, $new_vm_text_file)) {
+          $_SESSION['ari_error'] = "failed to copy $new_vm_text_file ...";
+        }
+
+        // copy text file to voicemail box
+        $new_vm_recording_file = $path . "/msg" . sprintf("%04d", $count) . $ARI_VOICEMAIL_AUDIO_FORMAT_DEFAULT;
+        if (!copy($vm_recording_file, $new_vm_recording_file)) {
+          $_SESSION['ari_error'] = "failed to copy $new_vm_recording_file ...";
+        }
+      }
+    }
+
+    // redirect to see updated page
+    $ret .= "
+      <head>
+        <script>
+        <!--
+          window.location = \"" . $_SESSION['ARI_ROOT'] . "?m=" . $m . "&f=display" . "\"
+        // -->
+        </script>
+      </head>";
+
+    return $ret;
+  }
+
+  /*
+   * Displays stats page
+   *
+   * @param $args
+   *   Common arguments
+   */
+  function display($args) {
+
+    global $ARI_HELP_FEATURE_CODES;
+
+    $display = new Display();
+
+    // args
+    $m = getArgument($args,'m');
+    $q = getArgument($args,'q');
+
+    $displayname = $_SESSION['ari_user']['displayname'];
+    $extension = $_SESSION['ari_user']['extension'];
+
+    // build page content
+    $ret .= checkErrorMessage();
+
+    if ($_SESSION['ari_user']['admin_help']) {
+      $header_text = _("Broadcast");
+    } else {
+      $header_text = sprintf(_("Broadcast for %s (%s)"),$displayname,$extension);
+    }
+
+    $broadcast_form .= "
+      <form enctype='multipart/form-data' action='" . $_SESSION['ARI_ROOT'] . "' method='POST'>
+         <input type='hidden' name='MAX_FILE_SIZE' value='10000000'>
+         <input type='hidden' name='upload' value='true'>
+         <input type='hidden' name='m' value='" . $m . "'>
+         <input type='hidden' name='f' value='action'>
+         <input type='hidden' name='a' value='broadcast'>
+         <table border=0 cellspacing=0 cellpadding=0>
+            <tr>
+               <td>
+              <i><b><font color='#6f6f6f'><small>Broadcast voicemail recording file: </small></font></b></i> <br>
+                 <input name='filename' size=30 type='file'>
+            </td>
+            </tr>
+            <tr>
+               <td>
+              <input type='submit' name='submit' value='Submit'>&nbsp&nbsp;<small><small>* Be patient (recording will upload when submitted)</small></small>
+            </td>
+            </tr>
+         </table>
+      </form>";
+
+    $ret .= $display->displayHeaderText($header_text);
+    $ret .= $display->displayLine();
+
+    // body
+    $ret .= $broadcast_form;
+
+    return $ret;
+  }
+
+}
+
+
+?>
